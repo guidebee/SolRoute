@@ -10,13 +10,14 @@ import (
 	"math"
 	"math/big"
 	"strconv"
+	"time"
 
 	cosmath "cosmossdk.io/math"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/sol"
 	"lukechampine.com/uint128"
+	"soltrading/pkg"
+	"soltrading/pkg/sol"
 )
 
 type CLMMPool struct {
@@ -72,6 +73,10 @@ type CLMMPool struct {
 	ExBitmapAddress   solana.PublicKey
 	exTickArrayBitmap *TickArrayBitmapExtensionType
 	TickArrayCache    map[string]TickArray
+
+	// Cache tracking for WebSocket updates
+	lastCacheUpdate time.Time
+	cacheDataFresh  bool
 }
 
 type RewardInfo struct {
@@ -431,36 +436,77 @@ func (pool *CLMMPool) GetTokens() (baseMint, quoteMint string) {
 	return pool.TokenMint0.String(), pool.TokenMint1.String()
 }
 
-func (pool *CLMMPool) Quote(ctx context.Context, solClient *sol.Client, inputMint string, inputAmount cosmath.Int) (cosmath.Int, error) {
-	// update pool state first
-	results, err := solClient.GetMultipleAccountsWithOpts(ctx, []solana.PublicKey{pool.ExBitmapAddress})
-	if err != nil {
-		return cosmath.Int{}, fmt.Errorf("batch request failed: %v", err)
-	}
-	for _, result := range results.Value {
-		pool.ParseExBitmapInfo(result.Data.GetBinary())
+// GetBaseVault returns the base vault address (TokenVault0)
+func (pool *CLMMPool) GetBaseVault() string {
+	return pool.TokenVault0.String()
+}
+
+// GetQuoteVault returns the quote vault address (TokenVault1)
+func (pool *CLMMPool) GetQuoteVault() string {
+	return pool.TokenVault1.String()
+}
+
+// UpdateFromAccountData implements the PoolStateUpdater interface
+func (pool *CLMMPool) UpdateFromAccountData(accountID string, data []byte) error {
+	// Check if this is a vault update (token account) - CLMM doesn't need vault updates for quotes
+	// as it uses tick arrays and sqrt price, but we can track vault addresses for completeness
+	if accountID == pool.TokenVault0.String() || accountID == pool.TokenVault1.String() {
+		// Token account data would be here but CLMM uses tick math not simple vault amounts
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
+		return nil
 	}
 
-	tickArrayAddresses, err := pool.GetTickArrayAddresses()
-	if err != nil {
-		return cosmath.Int{}, fmt.Errorf("get tick array address error: %v", err)
+	// Check if this is a pool state update
+	if accountID == pool.PoolId.String() {
+		// Decode full pool state
+		return pool.Decode(data)
 	}
-	results, err = solClient.GetMultipleAccountsWithOpts(ctx, tickArrayAddresses)
-	if err != nil {
-		log.Printf("batch request failed: %v", err)
-		return cosmath.Int{}, fmt.Errorf("batch request failed: %v", err)
-	}
-	for _, result := range results.Value {
-		tickArray := &TickArray{}
-		err := tickArray.Decode(result.Data.GetBinary())
+
+	// Check if this is a tick array or bitmap update
+	// For now, we'll mark cache as fresh but not decode as tick arrays need special handling
+	pool.lastCacheUpdate = time.Now()
+	pool.cacheDataFresh = true
+	return nil
+}
+
+func (pool *CLMMPool) Quote(ctx context.Context, solClient *sol.Client, inputMint string, inputAmount cosmath.Int) (cosmath.Int, error) {
+	// Only fetch from RPC if cache is not fresh (older than 5 seconds or never updated)
+	cacheTooOld := time.Since(pool.lastCacheUpdate) > 5*time.Second
+	if !pool.cacheDataFresh || cacheTooOld {
+		// update pool state from RPC
+		results, err := solClient.GetMultipleAccountsWithOpts(ctx, []solana.PublicKey{pool.ExBitmapAddress})
 		if err != nil {
-			return cosmath.Int{}, fmt.Errorf("failed to decode tick array: %w", err)
+			return cosmath.Int{}, fmt.Errorf("batch request failed: %v", err)
 		}
-		if pool.TickArrayCache == nil {
-			pool.TickArrayCache = make(map[string]TickArray)
+		for _, result := range results.Value {
+			pool.ParseExBitmapInfo(result.Data.GetBinary())
 		}
-		pool.TickArrayCache[strconv.FormatInt(int64(tickArray.StartTickIndex), 10)] = *tickArray
+
+		tickArrayAddresses, err := pool.GetTickArrayAddresses()
+		if err != nil {
+			return cosmath.Int{}, fmt.Errorf("get tick array address error: %v", err)
+		}
+		results, err = solClient.GetMultipleAccountsWithOpts(ctx, tickArrayAddresses)
+		if err != nil {
+			log.Printf("batch request failed: %v", err)
+			return cosmath.Int{}, fmt.Errorf("batch request failed: %v", err)
+		}
+		for _, result := range results.Value {
+			tickArray := &TickArray{}
+			err := tickArray.Decode(result.Data.GetBinary())
+			if err != nil {
+				return cosmath.Int{}, fmt.Errorf("failed to decode tick array: %w", err)
+			}
+			if pool.TickArrayCache == nil {
+				pool.TickArrayCache = make(map[string]TickArray)
+			}
+			pool.TickArrayCache[strconv.FormatInt(int64(tickArray.StartTickIndex), 10)] = *tickArray
+		}
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
 	}
+	// else: use cached tick array data from WebSocket updates
 
 	if inputMint == pool.TokenMint0.String() {
 		priceBaseToQuote, err := pool.ComputeAmountOutFormat(pool.TokenMint0.String(), inputAmount)

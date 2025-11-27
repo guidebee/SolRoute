@@ -5,7 +5,7 @@ import (
 
 	"cosmossdk.io/math"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg/sol"
 )
 
 // ProtocolName represents the string name of AMM protocol

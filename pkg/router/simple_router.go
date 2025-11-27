@@ -7,8 +7,10 @@ import (
 	"sync"
 
 	"cosmossdk.io/math"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg"
+	"soltrading/pkg/pool/pump"
+	"soltrading/pkg/pool/raydium"
+	"soltrading/pkg/sol"
 )
 
 type SimpleRouter struct {
@@ -42,6 +44,17 @@ func (r *SimpleRouter) QueryAllPools(ctx context.Context, baseMint, quoteMint st
 }
 
 func (r *SimpleRouter) GetBestPool(ctx context.Context, solClient *sol.Client, tokenIn string, amountIn math.Int) (pkg.Pool, math.Int, error) {
+	return r.GetBestPoolWithFilter(ctx, solClient, tokenIn, amountIn, nil, nil, 0)
+}
+
+func (r *SimpleRouter) GetBestPoolWithFilter(ctx context.Context, solClient *sol.Client, tokenIn string, amountIn math.Int, dexes, excludeDexes []string, minLiquidityUSD float64) (pkg.Pool, math.Int, error) {
+	// Filter pools based on protocol names and liquidity
+	filteredPools := r.filterPools(dexes, excludeDexes, minLiquidityUSD, tokenIn)
+
+	if len(filteredPools) == 0 {
+		return nil, math.ZeroInt(), fmt.Errorf("no pools found after filtering")
+	}
+
 	type quoteResult struct {
 		pool      pkg.Pool
 		outAmount math.Int
@@ -49,11 +62,11 @@ func (r *SimpleRouter) GetBestPool(ctx context.Context, solClient *sol.Client, t
 	}
 
 	// Create a channel to collect results
-	resultChan := make(chan quoteResult, len(r.Pools))
+	resultChan := make(chan quoteResult, len(filteredPools))
 	var wg sync.WaitGroup
 
 	// Launch goroutines for each pool
-	for _, pool := range r.Pools {
+	for _, pool := range filteredPools {
 		wg.Add(1)
 		go func(p pkg.Pool) {
 			defer wg.Done()
@@ -91,4 +104,110 @@ func (r *SimpleRouter) GetBestPool(ctx context.Context, solClient *sol.Client, t
 		return nil, math.ZeroInt(), fmt.Errorf("no route found")
 	}
 	return best, maxOut, nil
+}
+
+// getPoolLiquidity estimates the pool liquidity in USD based on reserves
+// For simplicity, we assume the output token (non-input) reserve represents USD value
+// This works well for WSOL/USDC pairs where USDC ≈ $1
+func getPoolLiquidity(pool pkg.Pool, tokenIn string) float64 {
+	tokenA, _ := pool.GetTokens()
+
+	// Determine which reserve to check (the output token side)
+	var liquidityRaw math.Int
+
+	// Try to extract reserves based on pool type
+	switch p := pool.(type) {
+	case *raydium.AMMPool:
+		// Raydium AMM pools
+		if tokenA == tokenIn {
+			// Input is tokenA, check tokenB reserve (quote)
+			liquidityRaw = p.QuoteReserve
+		} else {
+			// Input is tokenB, check tokenA reserve (base)
+			liquidityRaw = p.BaseReserve
+		}
+	case *raydium.CPMMPool:
+		// Raydium CPMM pools (same structure as AMM)
+		if tokenA == tokenIn {
+			liquidityRaw = p.QuoteReserve
+		} else {
+			liquidityRaw = p.BaseReserve
+		}
+	case *pump.PumpAMMPool:
+		// Pump AMM pools
+		if tokenA == tokenIn {
+			// Input is tokenA (base), check tokenB (quote)
+			liquidityRaw = p.QuoteAmount
+		} else {
+			// Input is tokenB (quote), check tokenA (base)
+			liquidityRaw = p.BaseAmount
+		}
+	default:
+		// For CLMM/DLMM/Whirlpool pools, we can't easily extract reserves without context
+		// Return a high value to not filter them out for now
+		return 1000000.0
+	}
+
+	if liquidityRaw.IsNil() || liquidityRaw.IsZero() {
+		return 0
+	}
+
+	// Convert to float with decimals adjustment (assume 6 decimals for stables/SOL)
+	liquidityFloat := float64(liquidityRaw.Int64()) / float64(1e6)
+	return liquidityFloat
+}
+
+// filterPools filters the pools based on dexes, excludeDexes, and minimum liquidity
+func (r *SimpleRouter) filterPools(dexes, excludeDexes []string, minLiquidityUSD float64, tokenIn string) []pkg.Pool {
+	// If no filters provided, return all pools
+	if len(dexes) == 0 && len(excludeDexes) == 0 && minLiquidityUSD == 0 {
+		return r.Pools
+	}
+
+	var filtered []pkg.Pool
+
+	for _, pool := range r.Pools {
+		protocolName := string(pool.ProtocolName())
+
+		// If dexes is specified, only include matching protocols
+		if len(dexes) > 0 {
+			found := false
+			for _, dex := range dexes {
+				if protocolName == dex {
+					found = true
+					break
+				}
+			}
+			if !found {
+				continue
+			}
+		}
+
+		// If excludeDexes is specified, skip matching protocols
+		if len(excludeDexes) > 0 {
+			excluded := false
+			for _, excludeDex := range excludeDexes {
+				if protocolName == excludeDex {
+					excluded = true
+					break
+				}
+			}
+			if excluded {
+				continue
+			}
+		}
+
+		// If minLiquidity is specified, check pool liquidity
+		if minLiquidityUSD > 0 {
+			liquidity := getPoolLiquidity(pool, tokenIn)
+			if liquidity < minLiquidityUSD {
+				log.Printf("Filtering out pool %s with low liquidity: $%.2f < $%.2f", pool.GetID()[:8], liquidity, minLiquidityUSD)
+				continue
+			}
+		}
+
+		filtered = append(filtered, pool)
+	}
+
+	return filtered
 }

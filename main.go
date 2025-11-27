@@ -6,9 +6,9 @@ import (
 
 	"cosmossdk.io/math"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg/protocol"
-	"github.com/solana-zh/solroute/pkg/router"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg/protocol"
+	"soltrading/pkg/router"
+	"soltrading/pkg/sol"
 )
 
 var (

@@ -1,4 +1,4 @@
-module github.com/solana-zh/solroute
+module soltrading
 
 go 1.24.0
 
@@ -6,6 +6,7 @@ require (
 	cosmossdk.io/math v1.5.3
 	github.com/gagliardetto/binary v0.8.0
 	github.com/gagliardetto/solana-go v1.12.0
+	github.com/gorilla/websocket v1.5.3
 	github.com/jito-labs/jito-go-rpc v0.2.1
 	github.com/mr-tron/base58 v1.2.0
 	golang.org/x/time v0.10.0

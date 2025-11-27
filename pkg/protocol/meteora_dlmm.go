@@ -7,9 +7,9 @@ import (
 
 	"github.com/gagliardetto/solana-go"
 	"github.com/gagliardetto/solana-go/rpc"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/pool/meteora"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg"
+	"soltrading/pkg/pool/meteora"
+	"soltrading/pkg/sol"
 )
 
 // MeteoraDlmmProtocol handles interactions with Meteora DLMM (Dynamic Liquidity Market Maker) pools

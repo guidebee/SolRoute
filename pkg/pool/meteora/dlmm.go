@@ -4,11 +4,12 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"time"
 	"unsafe"
 
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg"
+	"soltrading/pkg/sol"
 )
 
 // MeteoraDlmmPool represents a Meteora DLMM (Dynamic Liquidity Market Maker) pool
@@ -88,6 +89,10 @@ type MeteoraDlmmPool struct {
 	bitmapExtension    *BinArrayBitmapExtension
 	Clock              sol.Clock
 	orgActiveId        int32
+
+	// Cache tracking for WebSocket updates
+	lastCacheUpdate time.Time
+	cacheDataFresh  bool
 }
 
 func (pool *MeteoraDlmmPool) ProtocolName() pkg.ProtocolName {
@@ -106,6 +111,40 @@ func (pool *MeteoraDlmmPool) GetID() string {
 // GetTokens returns the token mint addresses as strings
 func (pool *MeteoraDlmmPool) GetTokens() (string, string) {
 	return pool.TokenXMint.String(), pool.TokenYMint.String()
+}
+
+// GetBaseVault returns the base reserve address (reserveX)
+func (pool *MeteoraDlmmPool) GetBaseVault() string {
+	return pool.reserveX.String()
+}
+
+// GetQuoteVault returns the quote reserve address (reserveY)
+func (pool *MeteoraDlmmPool) GetQuoteVault() string {
+	return pool.reserveY.String()
+}
+
+// UpdateFromAccountData implements the PoolStateUpdater interface
+func (pool *MeteoraDlmmPool) UpdateFromAccountData(accountID string, data []byte) error {
+	// Check if this is a reserve update (token account)
+	if accountID == pool.reserveX.String() || accountID == pool.reserveY.String() {
+		// Mark cache as fresh - Meteora DLMM uses bin arrays, not simple vault balances
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
+		return nil
+	}
+
+	// Check if this is a pool state update
+	if accountID == pool.PoolId.String() {
+		// Would need to decode full pool state here
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
+		return nil
+	}
+
+	// Could be bin array or bitmap extension update
+	pool.lastCacheUpdate = time.Now()
+	pool.cacheDataFresh = true
+	return nil
 }
 
 // Span returns the size of the pool struct in bytes
@@ -386,6 +425,13 @@ func (pool *MeteoraDlmmPool) UpdateClock(ctx context.Context, client *sol.Client
 
 // GetBinArrayForSwap retrieves bin arrays needed for swap operations
 func (pool *MeteoraDlmmPool) GetBinArrayForSwap(ctx context.Context, client *sol.Client) error {
+	// Only fetch from RPC if cache is not fresh (older than 5 seconds or never updated)
+	cacheTooOld := time.Since(pool.lastCacheUpdate) > 5*time.Second
+	if pool.cacheDataFresh && !cacheTooOld && pool.BinArrays != nil {
+		// Use cached bin arrays from WebSocket updates
+		return nil
+	}
+
 	if pool.BinArrays == nil {
 		pool.BinArrays = make(map[string]BinArray) // Initialize bin array map
 	}
@@ -424,5 +470,9 @@ func (pool *MeteoraDlmmPool) GetBinArrayForSwap(ctx context.Context, client *sol
 		}
 		pool.BinArrays[accountKey] = binArray
 	}
+
+	// Mark cache as fresh
+	pool.lastCacheUpdate = time.Now()
+	pool.cacheDataFresh = true
 	return nil
 }

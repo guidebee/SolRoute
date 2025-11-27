@@ -10,15 +10,16 @@ import (
 	"fmt"
 	"log"
 	"reflect"
+	"time"
 	"unsafe"
 
 	"cosmossdk.io/math"
 	cosmath "cosmossdk.io/math"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/sol"
 	"lukechampine.com/uint128"
+	"soltrading/pkg"
+	"soltrading/pkg/sol"
 )
 
 // AMMPool represents a Raydium AMM liquidity pool with all its parameters and state
@@ -98,6 +99,10 @@ type AMMPool struct {
 	QuoteAmount  cosmath.Int
 	BaseReserve  cosmath.Int
 	QuoteReserve cosmath.Int
+
+	// Cache tracking for WebSocket updates
+	lastCacheUpdate time.Time
+	cacheDataFresh  bool
 }
 
 func (pool *AMMPool) ProtocolName() pkg.ProtocolName {
@@ -323,6 +328,16 @@ func (p *AMMPool) GetTokens() (baseMint, quoteMint string) {
 	return p.BaseMint.String(), p.QuoteMint.String()
 }
 
+// GetBaseVault returns the base vault address
+func (p *AMMPool) GetBaseVault() string {
+	return p.BaseVault.String()
+}
+
+// GetQuoteVault returns the quote vault address
+func (p *AMMPool) GetQuoteVault() string {
+	return p.QuoteVault.String()
+}
+
 // Quote calculates the expected output amount for a given input amount
 // It takes into account the current pool reserves and fees
 func (p *AMMPool) Quote(
@@ -331,31 +346,38 @@ func (p *AMMPool) Quote(
 	inputMint string,
 	inputAmount cosmath.Int,
 ) (cosmath.Int, error) {
-	// update pool data first
-	accounts := make([]solana.PublicKey, 0)
-	accounts = append(accounts, p.BaseVault)
-	accounts = append(accounts, p.QuoteVault)
-	results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
-	if err != nil {
-		return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
-	}
-	for i, result := range results.Value {
-		if result == nil {
-			return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+	// Only fetch from RPC if cache is not fresh (older than 5 seconds or never updated)
+	cacheTooOld := time.Since(p.lastCacheUpdate) > 5*time.Second
+	if !p.cacheDataFresh || cacheTooOld {
+		// update pool data from RPC
+		accounts := make([]solana.PublicKey, 0)
+		accounts = append(accounts, p.BaseVault)
+		accounts = append(accounts, p.QuoteVault)
+		results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
+		if err != nil {
+			return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
 		}
-		accountKey := accounts[i].String()
-		if p.BaseVault.String() == accountKey {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			p.BaseAmount = amount
-		} else {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			p.QuoteAmount = amount
+		for i, result := range results.Value {
+			if result == nil {
+				return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+			}
+			accountKey := accounts[i].String()
+			if p.BaseVault.String() == accountKey {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				p.BaseAmount = amount
+			} else {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				p.QuoteAmount = amount
+			}
 		}
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
 	}
+	// else: use cached data from WebSocket updates
 
 	// Calculate effective reserves by subtracting pending PnL
 	p.BaseReserve = p.BaseAmount.Sub(cosmath.NewInt(int64(p.BaseNeedTakePnl)))
@@ -458,6 +480,55 @@ func (pool *AMMPool) BuildSwapInstructions(
 
 	instrs = append(instrs, &inst)
 	return instrs, nil
+}
+
+// UpdateFromAccountData updates the pool state from WebSocket account data
+func (p *AMMPool) UpdateFromAccountData(accountID string, data []byte) error {
+	// Check if this is the pool account itself
+	if accountID == p.PoolId.String() {
+		// Decode full pool state
+		if err := p.Decode(data); err != nil {
+			return fmt.Errorf("failed to decode pool data: %w", err)
+		}
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
+		return nil
+	}
+
+	// Check if this is a vault account
+	if accountID == p.BaseVault.String() {
+		// Decode SPL token account data (amount is at offset 64, 8 bytes)
+		if len(data) < 72 {
+			return fmt.Errorf("invalid base vault data length: %d", len(data))
+		}
+		amountBytes := data[64:72]
+		amountUint := binary.LittleEndian.Uint64(amountBytes)
+		p.BaseAmount = math.NewIntFromUint64(amountUint)
+
+		// Recalculate base reserve
+		p.BaseReserve = p.BaseAmount.Sub(cosmath.NewInt(int64(p.BaseNeedTakePnl)))
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
+		return nil
+	}
+
+	if accountID == p.QuoteVault.String() {
+		// Decode SPL token account data (amount is at offset 64, 8 bytes)
+		if len(data) < 72 {
+			return fmt.Errorf("invalid quote vault data length: %d", len(data))
+		}
+		amountBytes := data[64:72]
+		amountUint := binary.LittleEndian.Uint64(amountBytes)
+		p.QuoteAmount = math.NewIntFromUint64(amountUint)
+
+		// Recalculate quote reserve
+		p.QuoteReserve = p.QuoteAmount.Sub(cosmath.NewInt(int64(p.QuoteNeedTakePnl)))
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
+		return nil
+	}
+
+	return fmt.Errorf("unknown account ID for pool: %s", accountID)
 }
 
 type InSwapInstruction struct {

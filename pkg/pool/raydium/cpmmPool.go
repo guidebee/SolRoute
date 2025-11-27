@@ -4,13 +4,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"cosmossdk.io/math"
 	cosmath "cosmossdk.io/math"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg"
+	"soltrading/pkg/sol"
 )
 
 // CPMMPool represents the on-chain pool state
@@ -48,6 +49,10 @@ type CPMMPool struct {
 	QuoteDecimal     uint64
 	BaseNeedTakePnl  uint64
 	QuoteNeedTakePnl uint64
+
+	// Cache tracking for WebSocket updates
+	lastCacheUpdate time.Time
+	cacheDataFresh  bool
 }
 
 func (pool *CPMMPool) ProtocolName() pkg.ProtocolName {
@@ -198,31 +203,38 @@ func getAuthorityPDA() (solana.PublicKey, uint8, error) {
 }
 
 func (pool *CPMMPool) Quote(ctx context.Context, solClient *sol.Client, inputMint string, inputAmount math.Int) (math.Int, error) {
-	// update pool data first
-	accounts := make([]solana.PublicKey, 0)
-	accounts = append(accounts, pool.Token0Vault)
-	accounts = append(accounts, pool.Token1Vault)
-	results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
-	if err != nil {
-		return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
-	}
-	for i, result := range results.Value {
-		if result == nil {
-			return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+	// Only fetch from RPC if cache is not fresh (older than 5 seconds or never updated)
+	cacheTooOld := time.Since(pool.lastCacheUpdate) > 5*time.Second
+	if !pool.cacheDataFresh || cacheTooOld {
+		// update pool data from RPC
+		accounts := make([]solana.PublicKey, 0)
+		accounts = append(accounts, pool.Token0Vault)
+		accounts = append(accounts, pool.Token1Vault)
+		results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
+		if err != nil {
+			return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
 		}
-		accountKey := accounts[i].String()
-		if pool.Token0Vault.String() == accountKey {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			pool.BaseAmount = amount
-		} else {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			pool.QuoteAmount = amount
+		for i, result := range results.Value {
+			if result == nil {
+				return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+			}
+			accountKey := accounts[i].String()
+			if pool.Token0Vault.String() == accountKey {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				pool.BaseAmount = amount
+			} else {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				pool.QuoteAmount = amount
+			}
 		}
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
 	}
+	// else: use cached data from WebSocket updates
 
 	pool.BaseReserve = pool.BaseAmount.Sub(math.NewInt(int64(pool.BaseNeedTakePnl)))
 	pool.QuoteReserve = pool.QuoteAmount.Sub(math.NewInt(int64(pool.QuoteNeedTakePnl)))
@@ -263,4 +275,47 @@ func (pool *CPMMPool) Quote(ctx context.Context, solClient *sol.Client, inputMin
 		amountOutRaw = reserveOut.Mul(amountInWithFee).Quo(denominator)
 	}
 	return amountOutRaw, nil
+}
+
+// GetBaseVault returns the base vault address (Token0Vault)
+func (p *CPMMPool) GetBaseVault() string {
+	return p.Token0Vault.String()
+}
+
+// GetQuoteVault returns the quote vault address (Token1Vault)
+func (p *CPMMPool) GetQuoteVault() string {
+	return p.Token1Vault.String()
+}
+
+// UpdateFromAccountData implements the PoolStateUpdater interface
+func (p *CPMMPool) UpdateFromAccountData(accountID string, data []byte) error {
+	// Check if this is a vault update (token account)
+	if accountID == p.Token0Vault.String() || accountID == p.Token1Vault.String() {
+		// Token account data: extract balance from bytes 64-72
+		if len(data) < 72 {
+			return fmt.Errorf("insufficient data for token account: %d bytes", len(data))
+		}
+
+		amountBytes := data[64:72]
+		amountUint := binary.LittleEndian.Uint64(amountBytes)
+		amount := math.NewIntFromUint64(amountUint)
+
+		if accountID == p.Token0Vault.String() {
+			p.BaseAmount = amount
+		} else {
+			p.QuoteAmount = amount
+		}
+
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
+		return nil
+	}
+
+	// Check if this is a pool state update
+	if accountID == p.PoolId.String() {
+		// Decode full pool state
+		return p.Decode(data)
+	}
+
+	return fmt.Errorf("unknown account ID for pool update: %s", accountID)
 }

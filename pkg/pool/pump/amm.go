@@ -5,13 +5,14 @@ import (
 	"context"
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"cosmossdk.io/math"
 	bin "github.com/gagliardetto/binary"
 	"github.com/gagliardetto/solana-go"
-	"github.com/solana-zh/solroute/pkg"
-	"github.com/solana-zh/solroute/pkg/anchor"
-	"github.com/solana-zh/solroute/pkg/sol"
+	"soltrading/pkg"
+	"soltrading/pkg/anchor"
+	"soltrading/pkg/sol"
 )
 
 const (
@@ -48,6 +49,10 @@ type PumpAMMPool struct {
 	PoolId      solana.PublicKey
 	BaseAmount  math.Int
 	QuoteAmount math.Int
+
+	// Cache tracking for WebSocket updates
+	lastCacheUpdate time.Time
+	cacheDataFresh  bool
 }
 
 func (pool *PumpAMMPool) ProtocolName() pkg.ProtocolName {
@@ -127,6 +132,47 @@ func (l *PumpAMMPool) GetID() string {
 
 func (l *PumpAMMPool) GetTokens() (string, string) {
 	return l.BaseMint.String(), l.QuoteMint.String()
+}
+
+// GetBaseVault returns the base vault address
+func (p *PumpAMMPool) GetBaseVault() string {
+	return p.PoolBaseTokenAccount.String()
+}
+
+// GetQuoteVault returns the quote vault address
+func (p *PumpAMMPool) GetQuoteVault() string {
+	return p.PoolQuoteTokenAccount.String()
+}
+
+// UpdateFromAccountData implements the PoolStateUpdater interface
+func (p *PumpAMMPool) UpdateFromAccountData(accountID string, data []byte) error {
+	// Check if this is a vault update (token account)
+	if accountID == p.PoolBaseTokenAccount.String() || accountID == p.PoolQuoteTokenAccount.String() {
+		if len(data) < 72 {
+			return fmt.Errorf("insufficient data for token account: %d bytes", len(data))
+		}
+
+		amountBytes := data[64:72]
+		amountUint := binary.LittleEndian.Uint64(amountBytes)
+		amount := math.NewIntFromUint64(amountUint)
+
+		if accountID == p.PoolBaseTokenAccount.String() {
+			p.BaseAmount = amount
+		} else {
+			p.QuoteAmount = amount
+		}
+
+		p.lastCacheUpdate = time.Now()
+		p.cacheDataFresh = true
+		return nil
+	}
+
+	// Check if this is a pool state update
+	if accountID == p.PoolId.String() {
+		return p.Decode(data)
+	}
+
+	return fmt.Errorf("unknown account ID for pool update: %s", accountID)
 }
 
 func (s *PumpAMMPool) BuildSwapInstructions(
@@ -343,31 +389,38 @@ func (inst *SellSwapInstruction) Data() ([]byte, error) {
 }
 
 func (pool *PumpAMMPool) Quote(ctx context.Context, solClient *sol.Client, inputMint string, inputAmount math.Int) (math.Int, error) {
-	// update pool data first
-	accounts := make([]solana.PublicKey, 0)
-	accounts = append(accounts, pool.PoolBaseTokenAccount)
-	accounts = append(accounts, pool.PoolQuoteTokenAccount)
-	results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
-	if err != nil {
-		return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
-	}
-	for i, result := range results.Value {
-		if result == nil {
-			return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+	// Only fetch from RPC if cache is not fresh (older than 5 seconds or never updated)
+	cacheTooOld := time.Since(pool.lastCacheUpdate) > 5*time.Second
+	if !pool.cacheDataFresh || cacheTooOld {
+		// update pool data from RPC
+		accounts := make([]solana.PublicKey, 0)
+		accounts = append(accounts, pool.PoolBaseTokenAccount)
+		accounts = append(accounts, pool.PoolQuoteTokenAccount)
+		results, err := solClient.GetMultipleAccountsWithOpts(ctx, accounts)
+		if err != nil {
+			return math.NewInt(0), fmt.Errorf("batch request failed: %v", err)
 		}
-		accountKey := accounts[i].String()
-		if pool.PoolBaseTokenAccount.String() == accountKey {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			pool.BaseAmount = amount
-		} else {
-			amountBytes := result.Data.GetBinary()[64:72]
-			amountUint := binary.LittleEndian.Uint64(amountBytes)
-			amount := math.NewIntFromUint64(amountUint)
-			pool.QuoteAmount = amount
+		for i, result := range results.Value {
+			if result == nil {
+				return math.NewInt(0), fmt.Errorf("result is nil, account: %v", accounts[i].String())
+			}
+			accountKey := accounts[i].String()
+			if pool.PoolBaseTokenAccount.String() == accountKey {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				pool.BaseAmount = amount
+			} else {
+				amountBytes := result.Data.GetBinary()[64:72]
+				amountUint := binary.LittleEndian.Uint64(amountBytes)
+				amount := math.NewIntFromUint64(amountUint)
+				pool.QuoteAmount = amount
+			}
 		}
+		pool.lastCacheUpdate = time.Now()
+		pool.cacheDataFresh = true
 	}
+	// else: use cached data from WebSocket updates
 
 	feeRate := 1 - DefaultFeeRate
 	feeMultiplier := math.NewInt(int64(feeRate * float64(BaseDecimalInt)))
