@@ -1,5 +1,7 @@
 # SolRoute Quote API
 
+This command-line tool is part of the SolRoute fork that adds Jupiter-like quoting functionality. It queries on-chain DEX pools (Raydium, PumpSwap, Meteora, etc.) and returns the best single-hop quote as JSON (no transactions executed). See the top-level `README.md` for project-wide details and supported protocols.
+
 A console application that provides Jupiter-style DEX quote functionality for Solana token swaps. This tool queries multiple DEX protocols (Raydium, PumpSwap, Meteora) and returns the best available quote without executing any transactions.
 
 ## Features

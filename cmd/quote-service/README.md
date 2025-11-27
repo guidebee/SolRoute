@@ -1,12 +1,14 @@
 # SolRoute Quote Service
 
-A high-performance HTTP service that provides instant DEX quotes by periodically caching the best routes for SOL↔USDC trades. Instead of querying DEX pools in real-time (which takes 15-30 seconds), this service maintains up-to-date cached quotes and returns them instantly.
+This HTTP service is part of the SolRoute fork that adds Jupiter-like quoting functionality. It periodically queries on-chain DEX pools (Raydium, PumpSwap, Meteora, Whirlpool, etc.), caches best single-hop quotes for popular pairs (e.g., SOL↔USDC), and serves instant JSON responses to clients. See the top-level `README.md` for project-wide details and supported protocols.
+
+A high-performance HTTP service that provides instant DEX quotes by periodically caching the best routes for SOLUSDC trades. Instead of querying DEX pools in real-time (which takes 15-30 seconds), this service maintains up-to-date cached quotes and returns them instantly.
 
 ## Features
 
 - **Instant Responses**: Returns cached quotes in milliseconds instead of 15-30 seconds
 - **Periodic Refresh**: Automatically updates quotes at configurable intervals (default: 30 seconds)
-- **Multi-Protocol**: Queries Raydium (AMM, CLMM, CPMM), PumpSwap, and Meteora DLMM
+- **Multi-Protocol**: Queries Raydium (AMM, CLMM, CPMM), PumpSwap, Meteora DLMM, Whirlpool, and others
 - **RPC Pool**: Built-in load balancing across multiple RPC endpoints
 - **RESTful API**: Simple HTTP endpoints for integration
 - **CORS Enabled**: Ready for frontend integration
@@ -145,8 +147,8 @@ curl http://localhost:8080/
   "status": "running",
   "cachedQuotes": 2,
   "quotes": {
-    "So111...112-EPjF...t1v-1000000000": { /* cached quote */ },
-    "EPjF...t1v-So111...112-10000000": { /* cached quote */ }
+    "So111...112-EPjF...t1v-1000000000": {},
+    "EPjF...t1v-So111...112-10000000": {}
   },
   "endpoints": {
     "quote": "/quote?input=<mint>&output=<mint>&amount=<amount>",
@@ -330,3 +332,64 @@ watch -n 5 'curl -s http://localhost:8080/health | jq'
 ## License
 
 Same as parent project
+
+## Examples (runnable scripts)
+
+The `examples/quote-service/` folder contains small scripts that build the `quote-service`, run it locally, query the `/quote` and `/health` endpoints, and then stop the service. These are useful for quickly testing the service on Linux/macOS (`.sh`) and Windows PowerShell (`.ps1`).
+
+Bash example (linux/macos):
+
+```bash
+# examples/quote-service/run_example.sh
+# Build, run in background, query endpoints, then stop
+set -e
+
+# Build the binary
+go build -o quote-service ./cmd/quote-service
+
+# Start service in background
+./quote-service -port 8080 -refresh 30 -slippage 50 -ratelimit 20 &
+PID=$!
+echo "quote-service started (PID=$PID)"
+
+# Wait briefly for startup
+sleep 3
+
+# Query a quote (1 SOL -> USDC)
+curl -s "http://localhost:8080/quote?input=So11111111111111111111111111111111111111112&output=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000" | jq
+
+# Query health
+curl -s http://localhost:8080/health | jq
+
+# Stop the service
+kill $PID
+wait $PID 2>/dev/null || true
+echo "quote-service stopped"
+```
+
+PowerShell example (Windows):
+
+```powershell
+# examples/quote-service/run_example.ps1
+# Build, run, query endpoints, stop service
+Set-StrictMode -Version Latest
+
+# Build the binary
+go build -o quote-service.exe ./cmd/quote-service
+
+# Start service (background)
+$proc = Start-Process -FilePath .\quote-service.exe -ArgumentList '-port','8080','-refresh','30','-slippage','50','-ratelimit','20' -PassThru
+Write-Host "quote-service started (PID=$($proc.Id))"
+
+Start-Sleep -Seconds 3
+
+# Query a quote (1 SOL -> USDC)
+Invoke-RestMethod -Uri 'http://localhost:8080/quote?input=So11111111111111111111111111111111111111112&output=EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v&amount=1000000000' | ConvertTo-Json -Depth 5
+
+# Query health
+Invoke-RestMethod -Uri 'http://localhost:8080/health' | ConvertTo-Json -Depth 5
+
+# Stop the process
+Stop-Process -Id $proc.Id -Force
+Write-Host "quote-service stopped"
+```

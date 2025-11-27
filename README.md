@@ -1,6 +1,25 @@
 ## Project Overview
-this project was forked from [solroute](https://github.com/Solana-ZH/solroute)
-SolRoute is a Go SDK for building DEX routing services on Solana. It provides direct blockchain interaction without relying on third-party APIs, supporting multiple protocols including Raydium (AMM V4, CPMM, CLMM), PumpSwap AMM, and Meteora DLMM.
+This project is a fork of [solroute](https://github.com/Solana-ZH/solroute).
+
+SolRoute is a Go SDK for building DEX routing services on Solana. It provides direct blockchain interaction without relying on third-party APIs and implements an interface-based design for protocols and pools.
+
+This repository adds Jupiter-like quoting functionality on top of the SDK: a command-line `quote` tool and a `quote-service` HTTP server that aggregate on-chain quotes from many well-known Solana DEX pools and return the best single-hop quote as JSON.
+
+Major supported protocols/pool types include:
+- Raydium (AMM V4, CPMM, CLMM)
+- Meteora DLMM
+- PumpSwap AMM
+- Whirlpool (Concentrated Liquidity)
+- Saber, Orca, GooseFX, Woofi, Saros, SPL Token Swap and other community protocols
+
+Key features:
+- Best single-hop quote selection (Jupiter-style) across supported protocols
+- JSON output suitable for UIs and bots
+- RPC endpoint pooling and per-endpoint rate limiting
+- Optional caching in `quote-service` for popular pairs (e.g., SOL↔USDC) to provide instant responses
+- Both CLI (`cmd/quote`) and HTTP service (`cmd/quote-service`) entry points
+
+Common use cases: trading frontends, automated trading bots, price feeds, and arbitrage monitoring.
 
 ## Development Commands
 
